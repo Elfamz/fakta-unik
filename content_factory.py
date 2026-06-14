@@ -393,33 +393,37 @@ class ContentPipeline:
             logger.info("🚀 Memulai Gaming Clipper Factory (Clean Mode)...")
             self.notifier.send_message("🚀 Sedang memotong klip gaming terbaru...")
 
-            # 1. Ambil target video dan hitung detik mulai
+            # 1. Ambil target video (now uses search_query + judul_game)
             target = self.db.get_target_video()
-            start_seconds = (target["start_min"] * 60) + target["start_sec"]
+            search_query = target["search_query"]
+            game_title = target["judul_game"]
             
-            # 2. Download potongan video mentah dari YouTube
+            # Random start time for variety (60-300 seconds into video)
+            start_seconds = random.uniform(60, 300)
+            
+            # 2. Download potongan video mentah dari YouTube (supports search query)
             raw_clip = self.asset_mgr.download_youtube_segment(
-                target["url"], start_seconds, Config.CLIP_DURATION
+                search_query, start_seconds, Config.CLIP_DURATION
             )
             
             if not raw_clip:
                 raise ValueError("Gagal mengunduh potongan video dari YouTube.")
 
             # 3. Merakit video (Crop ke vertikal secara bersih)
-            video_final = VideoRenderer.assemble_gaming_clip(raw_clip, target["judul_game"])
+            video_final = VideoRenderer.assemble_gaming_clip(raw_clip, game_title)
 
             # 4. Buat Caption dengan Groq LLM
-            caption = self.ai_engine.generate_gaming_caption(target["judul_game"])
+            caption = self.ai_engine.generate_gaming_caption(game_title)
 
             # 5. Kirim ke Telegram
             telegram_caption = (
                 f"🎮 *KLIP GAMING OTOMATIS SIAP UPLOAD*\n\n"
-                f"🎮 *Game:* {target['judul_game']}\n"
-                f"🔗 *Sumber:* [YouTube Video]({target['url']})\n\n"
+                f"🎮 *Game:* {game_title}\n"
+                f"🔍 *Query:* {search_query}\n\n"
                 f"📝 *Caption Konten:*\n`{caption}`"
             )
             self.notifier.send_video(video_final, telegram_caption)
-            self.notifier.send_message("✅ Sukses memproses klip gaming tanpa subtitle!")
+            self.notifier.send_message("✅ Sukses memproses klip gaming!")
 
         except Exception as e:
             error_details = traceback.format_exc()
