@@ -11,6 +11,7 @@ import logging
 from moviepy import VideoFileClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip
 import yt_dlp
 from groq import Groq
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Set up logging profesional
 logging.basicConfig(
@@ -30,7 +31,7 @@ class Config:
     OUTPUT_DIR = "output"
     
     # Durasi default potong klip (detik)
-    CLIP_DURATION = 30 
+    CLIP_DURATION = 30
     
     # Video quality settings
     MAX_HEIGHT = 720
@@ -143,11 +144,12 @@ class VideoDownloaderManager:
 
     def _build_ydl_opts(self, stage: str, cookie_path: str = None):
         """Build yt-dlp options with flexible format selector."""
-        # Flexible format selector - tries multiple combinations
+        # Flexible format selector - avoids HLS, prioritizes native MP4
         format_selector = (
-            f'bestvideo[height<={Config.MAX_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/'
-            f'bestvideo[height<={Config.MAX_HEIGHT}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/'
-            f'bestvideo[height<={Config.MAX_HEIGHT}]+bestaudio/'
+            f'bestvideo[height<={Config.MAX_HEIGHT}][ext=mp4][protocol!=m3u8]+bestaudio[ext=m4a]/'
+            f'bestvideo[height<={Config.MAX_HEIGHT}][ext=mp4][protocol!=m3u8]+bestaudio/'
+            f'bestvideo[height<={Config.MAX_HEIGHT}][vcodec^=avc1][protocol!=m3u8]+bestaudio[acodec^=mp4a]/'
+            f'best[height<={Config.MAX_HEIGHT}][protocol!=m3u8]/'
             f'best[height<={Config.MAX_HEIGHT}]/'
             f'best'
         )
@@ -156,12 +158,13 @@ class VideoDownloaderManager:
             'format': format_selector,
             'quiet': True,
             'nocheckcertificate': True,
-            'socket_timeout': 30,
+            'socket_timeout': 60,
             'retries': 3,
             'ignoreerrors': False,
             'no_warnings': True,
             'extract_flat': False,
             'noplaylist': True,
+            'http_chunk_size': 10485760,
         }
         
         if cookie_path and os.path.exists(cookie_path):
@@ -174,25 +177,101 @@ class VideoDownloaderManager:
                 'skip_download': True,
             })
         elif stage == 'download':
-            base_opts.update({
-                'external_downloader': 'ffmpeg',
-                'external_downloader_args': {
-                    'args': []  # Will be set per-call
-                },
-            })
+            base_opts.update({})  # Will use _download_full_video + _trim_segment instead
         return base_opts
 
+    def _download_full_video(self, url: str, cookie_path: str = None) -> str:
+        """Download full video in MP4 format (no HLS) for reliable trimming."""
+        temp_name = f"full_{uuid.uuid4().hex}.mp4"
+        temp_path = os.path.join(Config.OUTPUT_DIR, temp_name)
+        
+        ydl_opts = {
+            'format': (
+                'bestvideo[height<=720][ext=mp4][protocol!=m3u8]+bestaudio[ext=m4a]/'
+                'bestvideo[height<=720][ext=mp4][protocol!=m3u8]+bestaudio/'
+                'bestvideo[height<=720][vcodec^=avc1][protocol!=m3u8]+bestaudio[acodec^=mp4a]/'
+                'best[height<=720][protocol!=m3u8]/'
+                'best[height<=720]/'
+                'best'
+            ),
+            'outtmpl': temp_path,
+            'quiet': True,
+            'nocheckcertificate': True,
+            'socket_timeout': 60,
+            'retries': 3,
+            'ignoreerrors': False,
+            'no_warnings': True,
+            'extract_flat': False,
+            'noplaylist': True,
+            'cookiefile': cookie_path if cookie_path and os.path.exists(cookie_path) else None,
+            'http_chunk_size': 10485760,
+        }
+        
+        logger.info(f"⬇️ Download full video (MP4, <=720p)...")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            logger.error(f"❌ Full video download error: {e}")
+            return None
+            
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 100_000:
+            logger.error("❌ Full video download failed or too small")
+            return None
+            
+        logger.info(f"✅ Full video: {temp_name} ({os.path.getsize(temp_path)/1024/1024:.2f} MB)")
+        self.track_file(temp_path)
+        return temp_path
+
+    def _trim_segment(self, input_path: str, start_time_sec: float, duration: float) -> str:
+        """Trim segment using local ffmpeg (fast, precise)."""
+        output_name = f"segment_{uuid.uuid4().hex}.mp4"
+        output_path = os.path.join(Config.OUTPUT_DIR, output_name)
+        
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(start_time_sec),
+            '-i', input_path,
+            '-t', str(duration),
+            '-maxrate', Config.MAX_BITRATE,
+            '-bufsize', Config.BUFFER_SIZE,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            output_path
+        ]
+        
+        logger.info(f"✂️ Trimming: {start_time_sec:.0f}s - {start_time_sec + duration:.0f}s")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                logger.error(f"❌ FFmpeg trim error: {result.stderr[-500:]}")
+                return None
+        except subprocess.TimeoutExpired:
+            logger.error("❌ FFmpeg trim timeout")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Trim error: {e}")
+            return None
+            
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 100_000:
+            logger.error("❌ Trim failed or output too small")
+            return None
+            
+        logger.info(f"✅ Segment: {output_name} ({os.path.getsize(output_path)/1024/1024:.2f} MB)")
+        self.track_file(output_path)
+        return output_path
+
     def download_youtube_segment(self, url: str, start_time_sec: float, duration: float) -> str:
-        """Mengunduh segmen spesifik dari YouTube menggunakan yt-dlp secara instan."""
+        """Download YouTube video and extract specific segment using two-phase approach."""
         # Handle search query (if not a full URL)
         if not url.startswith('http'):
             search_query = url
             url = None
         else:
             search_query = None
-        
-        output_name = f"raw_{uuid.uuid4().hex}.mp4"
-        output_path = os.path.join(Config.OUTPUT_DIR, output_name)
         
         cookie_path = "youtube_cookies.txt" if os.path.exists("youtube_cookies.txt") else None
         
@@ -232,45 +311,14 @@ class VideoDownloaderManager:
                 logger.error(f"❌ Search/extract error: {e}")
                 return None
         
-        # Phase 2: Download segment
-        download_opts = self._build_ydl_opts('download', cookie_path)
-        download_opts['outtmpl'] = output_path
-        download_opts['external_downloader_args']['args'] = [
-            '-ss', str(start_time_sec),
-            '-t', str(duration),
-            '-maxrate', Config.MAX_BITRATE,
-            '-bufsize', Config.BUFFER_SIZE,
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-c:a', 'aac',
-            '-b:a', '128k'
-        ]
-        
-        logger.info(f"⬇️ Download segment: {start_time_sec:.0f}s - {start_time_sec + duration:.0f}s")
-        
-        try:
-            with yt_dlp.YoutubeDL(download_opts) as ydl:
-                ydl.download([url])
-        except Exception as e:
-            logger.error(f"❌ Download error: {e}")
-            if os.path.exists(output_path):
-                os.remove(output_path)
+        # Phase 2: Download full video (MP4, not HLS)
+        full_video = self._download_full_video(url, cookie_path)
+        if not full_video:
             return None
-        
-        # Verify output
-        if not os.path.exists(output_path):
-            logger.error("❌ File output tidak terbuat")
-            return None
-        
-        file_size = os.path.getsize(output_path)
-        if file_size < 100_000:  # Less than 100KB = probably corrupted
-            logger.error(f"❌ File terlalu kecil ({file_size} bytes) - corrupt?")
-            os.remove(output_path)
-            return None
-        
-        logger.info(f"✅ Segment tersimpan: {output_name} ({file_size / 1024 / 1024:.2f} MB)")
-        self.track_file(output_path)
-        return output_path
+            
+        # Phase 3: Trim segment locally
+        segment = self._trim_segment(full_video, start_time_sec, duration)
+        return segment
 
 
 class AIContentEngine:
@@ -278,6 +326,12 @@ class AIContentEngine:
     def __init__(self):
         self.client = Groq(api_key=Config.GROQ_API_KEY)
 
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type((requests.RequestException, Exception)),
+        reraise=True
+    )
     def generate_gaming_caption(self, game_name: str) -> str:
         """Membuat caption sosial media bertema gaming yang viral."""
         prompt = f"Buat caption pendek TikTok/Shorts yang seru dan relateable untuk video klip game {game_name}. Berikan hook menarik di awal, emoji gaming, dan 8 hashtag gaming viral seperti #gaming #shorts #fyp. Hanya keluarkan teks caption."
@@ -336,8 +390,8 @@ class ContentPipeline:
     def run(self):
         video_final = None
         try:
-            logger.info("🎮 Memulai Gaming Clipper Factory (Clean Mode)...")
-            self.notifier.send_message("🎮 Sedang memotong klip gaming terbaru...")
+            logger.info("🚀 Memulai Gaming Clipper Factory (Clean Mode)...")
+            self.notifier.send_message("🚀 Sedang memotong klip gaming terbaru...")
 
             # 1. Ambil target video dan hitung detik mulai
             target = self.db.get_target_video()
@@ -361,7 +415,7 @@ class ContentPipeline:
             telegram_caption = (
                 f"🎮 *KLIP GAMING OTOMATIS SIAP UPLOAD*\n\n"
                 f"🎮 *Game:* {target['judul_game']}\n"
-                f"📺 *Sumber:* [YouTube Video]({target['url']})\n\n"
+                f"🔗 *Sumber:* [YouTube Video]({target['url']})\n\n"
                 f"📝 *Caption Konten:*\n`{caption}`"
             )
             self.notifier.send_video(video_final, telegram_caption)
