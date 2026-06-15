@@ -168,9 +168,11 @@ class VideoDownloaderManager:
         if cookie_path and os.path.exists(cookie_path):
             base_opts['cookiefile'] = cookie_path
             logger.info("🍪 Menggunakan cookies YouTube untuk bypass bot detection")
-        
+
         if stage == 'search':
+            # Search phase: minimal format selector (just extract info, no download)
             base_opts.update({
+                'format': 'best',  # Any format works for metadata extraction
                 'default_search': 'ytsearch1',
                 'skip_download': True,
             })
