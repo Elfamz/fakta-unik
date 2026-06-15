@@ -200,12 +200,12 @@ class VideoDownloaderManager:
                 'best'
             ),
             'outtmpl': temp_path,
-            'quiet': True,
+            'quiet': False,  # Enable verbose output for debugging
             'nocheckcertificate': True,
             'socket_timeout': 60,
             'retries': 3,
             'ignoreerrors': False,
-            'no_warnings': True,
+            'no_warnings': False,  # Show warnings for debugging
             'extract_flat': False,
             'noplaylist': True,
             'cookiefile': cookie_path if cookie_path and os.path.exists(cookie_path) else None,
@@ -213,6 +213,8 @@ class VideoDownloaderManager:
         }
         
         logger.info(f"⬇️ Download full video (MP4, <=720p)...")
+        logger.info(f"   URL: {url}")
+        logger.info(f"   Cookie: {'Yes' if cookie_path else 'No'}")
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
@@ -311,6 +313,8 @@ class VideoDownloaderManager:
                 video_duration = video_info.get("duration", 0)
                 
                 logger.info(f"📺 Ditemukan: {video_title[:60]}... ({video_duration}s)")
+                logger.info(f"   URL: {url}")
+                logger.info(f"   Duration: {video_duration}s, Start: {start_time_sec}s, Clip: {duration}s")
                 
                 # Validate segment timing
                 if start_time_sec >= video_duration:
