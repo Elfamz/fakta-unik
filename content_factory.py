@@ -279,11 +279,25 @@ class VideoDownloaderManager:
             search_query = None
         
         cookie_path = "youtube_cookies.txt" if os.path.exists("youtube_cookies.txt") else None
-        
+
         # Phase 1: Search if needed
         if search_query:
             logger.info(f"🔍 Mencari: {search_query}")
-            search_opts = self._build_ydl_opts('search', cookie_path)
+            # Minimal search opts - no format selector, just metadata extraction
+            search_opts = {
+                'default_search': 'ytsearch1',
+                'skip_download': True,
+                'quiet': True,
+                'nocheckcertificate': True,
+                'socket_timeout': 30,
+                'retries': 2,
+                'ignoreerrors': False,
+                'no_warnings': True,
+                'extract_flat': False,
+                'noplaylist': True,
+            }
+            if cookie_path:
+                search_opts['cookiefile'] = cookie_path
             try:
                 with yt_dlp.YoutubeDL(search_opts) as ydl:
                     search_result = ydl.extract_info(search_query, download=False)
