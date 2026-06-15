@@ -8,7 +8,6 @@ import sys
 import traceback
 import json
 import logging
-from moviepy import VideoFileClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip
 import yt_dlp
 from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -280,10 +279,11 @@ class VideoDownloaderManager:
         return (temp_path, nonlocal_start, nonlocal_duration)
 
     def _trim_segment(self, input_path: str, start_time_sec: float, duration: float) -> str:
-        """Trim segment using local ffmpeg (fast, precise)."""
+        """Trim segment using local ffmpeg - re-encode with ultrafast preset for compatibility."""
         output_name = f"segment_{uuid.uuid4().hex}.mp4"
         output_path = os.path.join(Config.OUTPUT_DIR, output_name)
         
+        # Re-encode with ultrafast - compatible with moviepy, fast enough
         cmd = [
             'ffmpeg', '-y',
             '-ss', str(start_time_sec),
@@ -292,26 +292,34 @@ class VideoDownloaderManager:
             '-maxrate', Config.MAX_BITRATE,
             '-bufsize', Config.BUFFER_SIZE,
             '-c:v', 'libx264',
-            '-preset', 'fast',
+            '-preset', 'ultrafast',
+            '-tune', 'fastdecode',
             '-c:a', 'aac',
             '-b:a', '128k',
             '-movflags', '+faststart',
             output_path
         ]
         
-        logger.info(f"✂️ Trimming: {start_time_sec:.0f}s - {start_time_sec + duration:.0f}s")
+        logger.info(f"✂️ Trimming (ultrafast): {start_time_sec:.0f}s - {start_time_sec + duration:.0f}s")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
             if result.returncode != 0:
                 logger.error(f"❌ FFmpeg trim error: {result.stderr[-500:]}")
                 return None
         except subprocess.TimeoutExpired:
-            logger.error("❌ FFmpeg trim timeout")
+            logger.error("❌ FFmpeg trim timeout (90s)")
             return None
         except Exception as e:
             logger.error(f"❌ Trim error: {e}")
             return None
             
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 100_000:
+            logger.error("❌ Trim failed or output too small")
+            return None
+            
+        logger.info(f"✅ Segment: {output_name} ({os.path.getsize(output_path)/1024/1024:.2f} MB)")
+        self.track_file(output_path)
+        return output_path
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 100_000:
             logger.error("❌ Trim failed or output too small")
             return None
@@ -421,34 +429,73 @@ class AIContentEngine:
 class VideoRenderer:
     @staticmethod
     def assemble_gaming_clip(raw_clip_path: str, game_name: str) -> str:
-        """Memotong aspek rasio menjadi vertikal tanpa teks subtitle tambahan."""
-        video = VideoFileClip(raw_clip_path)
-
-        # SMART CROPPING 16:9 ke 9:16 (Fokus ke Tengah Layar / Crosshair Game)
-        w, h = video.size
-        target_h = 1920
-        target_w = int(w * (target_h / h))
-        
-        video_resized = video.resized(height=target_h)
-        video_vertical = video_resized.cropped(
-            x_center=target_w / 2, y_center=target_h / 2, 
-            width=1080, height=1920
-        )
-
-        # RENDER LANGSUNG VIDEO VERTIKAL BERSIH
+        """Crop 16:9 to 9:16 vertical using pure ffmpeg (no MoviePy)."""
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = os.path.join(Config.OUTPUT_DIR, f"clip_{game_name}_{timestamp}.mp4")
         
-        logger.info("Memulai proses kompresi video vertikal...")
-        video_vertical.write_videofile(
-            output_file, codec='libx264', audio_codec='aac', fps=30, 
-            preset='fast', logger=None
+        logger.info("🎬 Memulai crop & kompresi vertikal (pure ffmpeg)...")
+        
+        # Get input video dimensions
+        probe_cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'csv=p=0',
+            raw_clip_path
+        ]
+        try:
+            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                logger.error(f"❌ ffprobe error: {result.stderr}")
+                return None
+            w, h = map(int, result.stdout.strip().split(','))
+        except Exception as e:
+            logger.error(f"❌ Failed to get video dimensions: {e}")
+            return None
+        
+        # Calculate crop for 16:9 -> 9:16 (center crop)
+        # Target: 1080x1920 (9:16)
+        # Scale height to 1920, then crop width to 1080 from center
+        # ffmpeg filter: scale=-2:1920, crop=1080:1920:(ow-1080)/2:(oh-1920)/2
+        vf_filter = (
+            f"scale=-2:1920,"
+            f"crop=1080:1920:(ow-1080)/2:(oh-1920)/2,"
+            f"setsar=1"
         )
         
-        # Lepas memori berkas video
-        video_vertical.close()
-        video.close()
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', raw_clip_path,
+            '-vf', vf_filter,
+            '-maxrate', Config.MAX_BITRATE,
+            '-bufsize', Config.BUFFER_SIZE,
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            output_file
+        ]
         
+        logger.info(f"🎬 Crop 16:9→9:16 + compress: {w}x{h} → 1080x1920")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if result.returncode != 0:
+                logger.error(f"❌ FFmpeg crop+compress error: {result.stderr[-500:]}")
+                return None
+        except subprocess.TimeoutExpired:
+            logger.error("❌ FFmpeg crop+compress timeout (180s)")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Crop+compress error: {e}")
+            return None
+            
+        if not os.path.exists(output_file) or os.path.getsize(output_file) < 100_000:
+            logger.error("❌ Output failed or too small")
+            return None
+            
+        logger.info(f"✅ Final clip: {os.path.basename(output_file)} ({os.path.getsize(output_file)/1024/1024:.2f} MB)")
         return output_file
 
 

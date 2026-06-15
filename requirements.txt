@@ -1,5 +1,4 @@
 edge-tts
-moviepy
 requests
 groq
 python-telegram-bot>=20.0
