@@ -601,10 +601,17 @@ Catatan:
 
 class VideoRenderer:
     @staticmethod
-    def assemble_gaming_clip(raw_clip_path: str, game_name: str) -> str:
-        """Crop 16:9 to 9:16 vertical using pure ffmpeg (no MoviePy)."""
+    def assemble_gaming_clip(raw_clip_path: str, game_name: str, session_dir: str = None, metadata: dict = None) -> tuple:
+        """Crop 16:9 to 9:16 vertical using pure ffmpeg (no MoviePy).
+        Returns: (output_file_path, metadata_dict)"""
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = os.path.join(Config.OUTPUT_DIR, f"clip_{game_name}_{timestamp}.mp4")
+        
+        # Use session directory if provided, else default output
+        if session_dir:
+            os.makedirs(session_dir, exist_ok=True)
+            output_file = os.path.join(session_dir, f"clip_{game_name}_{timestamp}.mp4")
+        else:
+            output_file = os.path.join(Config.OUTPUT_DIR, f"clip_{game_name}_{timestamp}.mp4")
         
         logger.info("🎬 Memulai crop & kompresi vertikal (pure ffmpeg)...")
         
@@ -620,11 +627,11 @@ class VideoRenderer:
             result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
             if result.returncode != 0:
                 logger.error(f"❌ ffprobe error: {result.stderr}")
-                return None
+                return None, None
             w, h = map(int, result.stdout.strip().split(','))
         except Exception as e:
             logger.error(f"❌ Failed to get video dimensions: {e}")
-            return None
+            return None, None
         
         # Calculate crop for 16:9 -> 9:16 (center crop)
         # Target: 1080x1920 (9:16)
@@ -656,20 +663,40 @@ class VideoRenderer:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             if result.returncode != 0:
                 logger.error(f"❌ FFmpeg crop+compress error: {result.stderr[-500:]}")
-                return None
+                return None, None
         except subprocess.TimeoutExpired:
             logger.error("❌ FFmpeg crop+compress timeout (180s)")
-            return None
+            return None, None
         except Exception as e:
             logger.error(f"❌ Crop+compress error: {e}")
-            return None
+            return None, None
             
         if not os.path.exists(output_file) or os.path.getsize(output_file) < 100_000:
             logger.error("❌ Output failed or too small")
-            return None
+            return None, None
             
-        logger.info(f"✅ Final clip: {os.path.basename(output_file)} ({os.path.getsize(output_file)/1024/1024:.2f} MB)")
-        return output_file
+        file_size_mb = os.path.getsize(output_file) / 1024 / 1024
+        logger.info(f"✅ Final clip: {os.path.basename(output_file)} ({file_size_mb:.2f} MB)")
+        
+        # Build metadata
+        clip_metadata = {
+            "output_file": output_file,
+            "file_name": os.path.basename(output_file),
+            "file_size_mb": round(file_size_mb, 2),
+            "resolution": "1080x1920",
+            "aspect_ratio": "9:16",
+            "source_dimensions": f"{w}x{h}",
+            "codec": "libx264",
+            "preset": "ultrafast",
+            "audio_codec": "aac",
+            "audio_bitrate": "128k",
+        }
+        
+        # Merge with provided metadata
+        if metadata:
+            clip_metadata.update(metadata)
+        
+        return output_file, clip_metadata
 
 
 class ContentPipeline:
@@ -683,9 +710,18 @@ class ContentPipeline:
 
     def run(self):
         video_final = None
+        session_dir = None
+        clip_metadata = None
+        
         try:
             logger.info("🚀 Memulai Gaming Clipper Factory (Clean Mode)...")
             self.notifier.send_message("🚀 Sedang memotong klip gaming terbaru...")
+
+            # Create session folder
+            session_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_dir = os.path.join(Config.OUTPUT_DIR, f"session_{session_timestamp}")
+            os.makedirs(session_dir, exist_ok=True)
+            logger.info(f"📁 Session folder: {session_dir}")
 
             # 1. Ambil target video
             target = self.db.get_target_video()
@@ -693,7 +729,6 @@ class ContentPipeline:
             game_title = target["judul_game"]
 
             # 2. Download & AI Highlight Detection → clip best segment
-            # start_time_sec & duration akan di-determine oleh AI highlight detection di dalam
             raw_clip = self.asset_mgr.download_youtube_segment(
                 search_query, 0, Config.CLIP_DURATION
             )
@@ -701,17 +736,42 @@ class ContentPipeline:
             if not raw_clip:
                 raise ValueError("Gagal mengunduh potongan video dari YouTube.")
 
-            # 3. Merakit video (Crop ke vertikal secara bersih)
-            video_final = VideoRenderer.assemble_gaming_clip(raw_clip, game_title)
+            # 3. Merakit video (Crop ke vertikal secara bersih) - dengan session folder
+            video_final, clip_metadata = VideoRenderer.assemble_gaming_clip(
+                raw_clip, 
+                game_title, 
+                session_dir=session_dir,
+                metadata={
+                    "game_title": game_title,
+                    "search_query": search_query,
+                    "clip_duration_sec": Config.CLIP_DURATION,
+                    "session_timestamp": datetime.datetime.now().isoformat(),
+                }
+            )
+
+            if not video_final or not clip_metadata:
+                raise ValueError("Gagal merender video vertikal.")
+
+            # Save metadata JSON
+            metadata_file = os.path.join(session_dir, "metadata.json")
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(clip_metadata, f, indent=2, ensure_ascii=False)
+            logger.info(f"💾 Metadata saved: {metadata_file}")
 
             # 4. Buat Caption dengan Groq LLM
             caption = self.ai_engine.generate_gaming_caption(game_title)
 
-            # 5. Kirim ke Telegram
+            # 5. Kirim ke Telegram dengan metadata
+            file_size = clip_metadata.get('file_size_mb', 'N/A')
+            resolution = clip_metadata.get('resolution', 'N/A')
+            source_dims = clip_metadata.get('source_dimensions', 'N/A')
+            
             telegram_caption = (
                 f"🎮 *KLIP GAMING OTOMATIS SIAP UPLOAD*\n\n"
                 f"🎮 *Game:* {game_title}\n"
-                f"🔍 *Query:* {search_query}\n\n"
+                f"🔍 *Query:* {search_query}\n"
+                f"📊 *Resolution:* {resolution} (from {source_dims})\n"
+                f"📦 *Size:* {file_size} MB\n\n"
                 f"📝 *Caption Konten:*\n`{caption}`"
             )
             self.notifier.send_video(video_final, telegram_caption)
