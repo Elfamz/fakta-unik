@@ -6,3 +6,4 @@ python-telegram-bot>=20.0
 pydub
 yt-dlp
 tenacity
+python-dotenv

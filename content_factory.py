@@ -13,6 +13,13 @@ import yt_dlp
 from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+# Load .env file if exists (for local development)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, use system env vars only
+
 # Set up logging profesional
 logging.basicConfig(
     level=logging.INFO,
