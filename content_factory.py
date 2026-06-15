@@ -293,8 +293,9 @@ class VideoDownloaderManager:
                 'retries': 2,
                 'ignoreerrors': False,
                 'no_warnings': True,
-                'extract_flat': False,
+                'extract_flat': True,  # Don't process video formats
                 'noplaylist': True,
+                'simulate': True,  # Don't actually download or process formats
             }
             if cookie_path:
                 search_opts['cookiefile'] = cookie_path
