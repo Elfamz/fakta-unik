@@ -180,10 +180,49 @@ class VideoDownloaderManager:
             base_opts.update({})  # Will use _download_full_video + _trim_segment instead
         return base_opts
 
-    def _download_full_video(self, url: str, cookie_path: str = None) -> str:
+    def _download_full_video(self, url: str, cookie_path: str = None, start_time_sec: float = 0, duration: float = 30) -> tuple:
         """Download full video in MP4 format (no HLS) for reliable trimming."""
         temp_name = f"full_{uuid.uuid4().hex}.mp4"
         temp_path = os.path.join(Config.OUTPUT_DIR, temp_name)
+        
+        # First, get video info (duration) without downloading
+        info_opts = {
+            'quiet': True,
+            'nocheckcertificate': True,
+            'socket_timeout': 30,
+            'retries': 2,
+            'ignoreerrors': False,
+            'no_warnings': True,
+            'extract_flat': False,
+            'noplaylist': True,
+        }
+        if cookie_path and os.path.exists(cookie_path):
+            info_opts['cookiefile'] = cookie_path
+        
+        video_duration = 0
+        try:
+            with yt_dlp.YoutubeDL(info_opts) as ydl:
+                video_info = ydl.extract_info(url, download=False)
+                video_duration = video_info.get("duration", 0)
+                logger.info(f"📊 Video duration: {video_duration}s")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not get video duration: {e}")
+        
+        # Validate and adjust segment timing
+        nonlocal_start = start_time_sec
+        nonlocal_duration = duration
+        if video_duration > 0:
+            if nonlocal_start >= video_duration:
+                nonlocal_start = max(0, video_duration - nonlocal_duration - 5)
+                logger.warning(f"Start time melebihi durasi video, adjust ke {nonlocal_start}s")
+            
+            if nonlocal_start + nonlocal_duration > video_duration:
+                nonlocal_duration = video_duration - nonlocal_start - 1
+                logger.warning(f"Durasi dipotong ke {nonlocal_duration}s agar muat di video")
+            
+            if nonlocal_duration <= 0:
+                logger.error("Durasi segment tidak valid")
+                return None
         
         ydl_opts = {
             'format': (
@@ -215,6 +254,7 @@ class VideoDownloaderManager:
         logger.info(f"⬇️ Download full video (MP4, <=720p)...")
         logger.info(f"   URL: {url}")
         logger.info(f"   Cookie: {'Yes' if cookie_path else 'No'}")
+        logger.info(f"   Trim: {nonlocal_start:.0f}s - {nonlocal_start + nonlocal_duration:.0f}s")
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
@@ -228,7 +268,9 @@ class VideoDownloaderManager:
             
         logger.info(f"✅ Full video: {temp_name} ({os.path.getsize(temp_path)/1024/1024:.2f} MB)")
         self.track_file(temp_path)
-        return temp_path
+        
+        # Update start_time_sec and duration for trim phase
+        return (temp_path, nonlocal_start, nonlocal_duration)
 
     def _trim_segment(self, input_path: str, start_time_sec: float, duration: float) -> str:
         """Trim segment using local ffmpeg (fast, precise)."""
@@ -285,11 +327,11 @@ class VideoDownloaderManager:
         # Phase 1: Search if needed
         if search_query:
             logger.info(f"🔍 Mencari: {search_query}")
-            # Minimal search opts - no format selector, just metadata extraction
+            # Search with playlistend=1 to get single result with full info
             search_opts = {
                 'default_search': 'ytsearch1',
                 'skip_download': True,
-                'extract_flat': True,  # Flat extraction - no format processing
+                'playlistend': 1,
                 'quiet': True,
                 'nocheckcertificate': True,
                 'socket_timeout': 30,
@@ -309,38 +351,40 @@ class VideoDownloaderManager:
                     return None
                 
                 video_info = search_result["entries"][0]
-                url = video_info.get("url") or video_info.get("webpage_url")
+                url = video_info.get("webpage_url") or video_info.get("url")
                 video_title = video_info.get("title", "Unknown")
                 video_duration = video_info.get("duration", 0)
                 
                 logger.info(f"📺 Ditemukan: {video_title[:60]}... ({video_duration}s)")
                 logger.info(f"   URL: {url}")
-                logger.info(f"   Duration: {video_duration}s, Start: {start_time_sec}s, Clip: {duration}s")
                 
                 # Validate segment timing
-                if start_time_sec >= video_duration:
-                    start_time_sec = max(0, video_duration - duration - 5)
-                    logger.warning(f"Start time melebihi durasi video, adjust ke {start_time_sec}s")
-                
-                if start_time_sec + duration > video_duration:
-                    duration = video_duration - start_time_sec - 1
-                    logger.warning(f"Durasi dipotong ke {duration}s agar muat di video")
-                
-                if duration <= 0:
-                    logger.error("Durasi segment tidak valid")
-                    return None
+                if video_duration > 0:
+                    if start_time_sec >= video_duration:
+                        start_time_sec = max(0, video_duration - duration - 5)
+                        logger.warning(f"Start time melebihi durasi video, adjust ke {start_time_sec}s")
                     
+                    if start_time_sec + duration > video_duration:
+                        duration = video_duration - start_time_sec - 1
+                        logger.warning(f"Durasi dipotong ke {duration}s agar muat di video")
+                    
+                    if duration <= 0:
+                        logger.error("Durasi segment tidak valid")
+                        return None
+                
             except Exception as e:
                 logger.error(f"❌ Search/extract error: {e}")
                 return None
         
         # Phase 2: Download full video (MP4, not HLS)
-        full_video = self._download_full_video(url, cookie_path)
-        if not full_video:
+        download_result = self._download_full_video(url, cookie_path, start_time_sec, duration)
+        if not download_result:
             return None
-            
+        
+        full_video, adjusted_start, adjusted_duration = download_result
+        
         # Phase 3: Trim segment locally
-        segment = self._trim_segment(full_video, start_time_sec, duration)
+        segment = self._trim_segment(full_video, adjusted_start, adjusted_duration)
         return segment
 
 
