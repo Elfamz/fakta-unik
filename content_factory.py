@@ -288,8 +288,8 @@ class VideoDownloaderManager:
             # Minimal search opts - no format selector, just metadata extraction
             search_opts = {
                 'default_search': 'ytsearch1',
-                'skip_download': True,  # Only extract info, don't download
-                'format': 'bestaudio/best',  # Minimal format to avoid selection error
+                'skip_download': True,
+                'extract_flat': True,  # Flat extraction - no format processing
                 'quiet': True,
                 'nocheckcertificate': True,
                 'socket_timeout': 30,
