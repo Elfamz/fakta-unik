@@ -127,8 +127,9 @@ class TelegramNotifier:
 
 class VideoDownloaderManager:
     """Mengurus download video gaming dari YouTube secara efisien."""
-    def __init__(self):
+    def __init__(self, ai_engine=None):
         self.temp_files = []
+        self.ai_engine = ai_engine
         os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
 
     def track_file(self, filepath: str):
@@ -328,21 +329,86 @@ class VideoDownloaderManager:
         self.track_file(output_path)
         return output_path
 
+    def _download_subtitles(self, url: str, cookie_path: str = None) -> str:
+        """Download subtitles/transcript from YouTube video."""
+        logger.info("📝 Mengunduh subtitle/transcript...")
+        temp_sub = os.path.join(Config.OUTPUT_DIR, f"sub_{uuid.uuid4().hex}.vtt")
+        
+        ydl_opts = {
+            'skip_download': True,
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['id', 'en', 'en-US'],
+            'subtitlesformat': 'vtt',
+            'outtmpl': temp_sub.replace('.vtt', ''),
+            'quiet': True,
+            'nocheckcertificate': True,
+            'socket_timeout': 30,
+            'retries': 2,
+            'ignoreerrors': False,
+            'no_warnings': True,
+            'extract_flat': False,
+            'noplaylist': True,
+        }
+        if cookie_path and os.path.exists(cookie_path):
+            ydl_opts['cookiefile'] = cookie_path
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            logger.warning(f"⚠️ Subtitle download failed: {e}")
+            return None
+        
+        # Find downloaded subtitle file
+        for ext in ['.id.vtt', '.en.vtt', '.en-US.vtt', '.vtt']:
+            sub_path = temp_sub.replace('.vtt', ext)
+            if os.path.exists(sub_path):
+                logger.info(f"✅ Subtitle ditemukan: {sub_path}")
+                return sub_path
+        
+        logger.warning("⚠️ Tidak ada subtitle yang tersedia")
+        return None
+
+    def _parse_vtt_transcript(self, vtt_path: str) -> str:
+        """Parse VTT file to plain text transcript."""
+        try:
+            with open(vtt_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Simple VTT parsing - remove timestamps and tags
+            lines = content.split('\n')
+            transcript_lines = []
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith('WEBVTT') or '-->' in line or line.startswith('NOTE'):
+                    continue
+                # Remove inline tags like <00:00:00.000>
+                import re
+                line = re.sub(r'<\d{2}:\d{2}:\d{2}\.\d{3}>', '', line)
+                line = re.sub(r'<[^>]+>', '', line)
+                if line:
+                    transcript_lines.append(line)
+            
+            return ' '.join(transcript_lines)
+        except Exception as e:
+            logger.error(f"❌ VTT parse error: {e}")
+            return ""
+
     def download_youtube_segment(self, url: str, start_time_sec: float, duration: float) -> str:
-        """Download YouTube video and extract specific segment using two-phase approach."""
+        """Download YouTube video, extract highlights via AI, then clip best segment."""
         # Handle search query (if not a full URL)
         if not url.startswith('http'):
             search_query = url
             url = None
         else:
             search_query = None
-        
+
         cookie_path = "youtube_cookies.txt" if os.path.exists("youtube_cookies.txt") else None
 
         # Phase 1: Search if needed
         if search_query:
             logger.info(f"🔍 Mencari: {search_query}")
-            # Search with playlistend=1 to get single result with full info
             search_opts = {
                 'default_search': 'ytsearch1',
                 'skip_download': True,
@@ -360,51 +426,84 @@ class VideoDownloaderManager:
             try:
                 with yt_dlp.YoutubeDL(search_opts) as ydl:
                     search_result = ydl.extract_info(search_query, download=False)
-                
+
                 if not search_result or "entries" not in search_result or not search_result["entries"]:
                     logger.error("❌ Tidak ada hasil pencarian")
                     return None
-                
+
                 video_info = search_result["entries"][0]
                 url = video_info.get("webpage_url") or video_info.get("url")
                 video_title = video_info.get("title", "Unknown")
                 video_duration = video_info.get("duration", 0)
-                
+
                 logger.info(f"📺 Ditemukan: {video_title[:60]}... ({video_duration}s)")
                 logger.info(f"   URL: {url}")
-                
-                # Validate segment timing
-                if video_duration > 0:
-                    if start_time_sec >= video_duration:
-                        start_time_sec = max(0, video_duration - duration - 5)
-                        logger.warning(f"Start time melebihi durasi video, adjust ke {start_time_sec}s")
-                    
-                    if start_time_sec + duration > video_duration:
-                        duration = video_duration - start_time_sec - 1
-                        logger.warning(f"Durasi dipotong ke {duration}s agar muat di video")
-                    
-                    if duration <= 0:
-                        logger.error("Durasi segment tidak valid")
-                        return None
-                
+
             except Exception as e:
                 logger.error(f"❌ Search/extract error: {e}")
                 return None
+
+        # Phase 1.5: Download subtitles & AI Highlight Detection
+        transcript = ""
+        highlights = []
         
+        if video_duration > 60:  # Only for videos longer than 1 minute
+            vtt_path = self._download_subtitles(url, cookie_path)
+            if vtt_path:
+                transcript = self._parse_vtt_transcript(vtt_path)
+                if transcript and len(transcript) > 200:  # Minimum transcript length
+                    logger.info(f"📝 Transcript length: {len(transcript)} chars")
+                    logger.info("🤖 Analisis highlight dengan AI...")
+                    highlights = self.ai_engine.extract_highlights(
+                        transcript, video_duration, Config.CLIP_DURATION, max_highlights=3
+                    )
+                    if highlights:
+                        logger.info(f"✅ {len(highlights)} highlight ditemukan:")
+                        for i, h in enumerate(highlights):
+                            logger.info(f"   #{i+1} {h['start_sec']}s-{h['end_sec']}s (score: {h['score']}): {h['reason'][:80]}")
+                # Cleanup subtitle file
+                try:
+                    if vtt_path and os.path.exists(vtt_path):
+                        os.remove(vtt_path)
+                except:
+                    pass
+
+        # Determine best segment
+        if highlights:
+            # Use best AI highlight
+            best = highlights[0]
+            start_time_sec = best["start_sec"]
+            duration = best["duration"]
+            logger.info(f"🎯 AI PILIH: {start_time_sec}s - {start_time_sec + duration}s (score: {best['score']})")
+        else:
+            # Fallback: random
+            start_time_sec = random.uniform(60, min(300, video_duration - duration - 10))
+            logger.info(f"🎲 FALLBACK random: {start_time_sec:.0f}s")
+
+        # Validate segment timing
+        if video_duration > 0:
+            if start_time_sec >= video_duration:
+                start_time_sec = max(0, video_duration - duration - 5)
+            if start_time_sec + duration > video_duration:
+                duration = video_duration - start_time_sec - 1
+            if duration <= 0:
+                logger.error("Durasi segment tidak valid")
+                return None
+
         # Phase 2: Download full video (MP4, not HLS)
         download_result = self._download_full_video(url, cookie_path, start_time_sec, duration)
         if not download_result:
             return None
-        
+
         full_video, adjusted_start, adjusted_duration = download_result
-        
+
         # Phase 3: Trim segment locally
         segment = self._trim_segment(full_video, adjusted_start, adjusted_duration)
         return segment
 
 
 class AIContentEngine:
-    """Mesin AI untuk membuat deskripsi/caption konten."""
+    """Mesin AI untuk membuat deskripsi/caption konten dan detek highlight."""
     def __init__(self):
         self.client = Groq(api_key=Config.GROQ_API_KEY)
 
@@ -424,6 +523,80 @@ class AIContentEngine:
             max_tokens=200,
         )
         return response.choices[0].message.content.strip()
+
+    def extract_highlights(self, transcript: str, video_duration: int, clip_duration: int = 30, max_highlights: int = 3) -> list:
+        """
+        Analisis transcript dengan AI untuk menemukan segment paling engaging.
+        Return: list of dict [{start_sec, end_sec, reason, score}]
+        """
+        # Truncate transcript if too long (Groq limit ~130k tokens, ~100k chars safe)
+        max_chars = 80000
+        if len(transcript) > max_chars:
+            transcript = transcript[:max_chars] + "\n...[truncated]"
+
+        prompt = f"""Analisis transcript video gaming berikut (durasi: {video_duration}s) dan temukan {max_highlights} segment paling MENARIK/CLIP-WORTHY untuk konten TikTok/Shorts/Reels gaming.
+
+Kriteria segment bagus:
+- Aksi intense (clutch, outplay, teamfight, ace, 1vX)
+- Momen emosional (reaction, scream, laugh, surprise)
+- Highlight skill (combo, mechanic, prediction, outsmart)
+- Narasi menarik (storytelling, tips, funny moment)
+- Duration target: {clip_duration} detik per clip
+
+Transcript:
+{transcript}
+
+Format output HANYA JSON array (tanpa markdown):
+[
+  {{"start_sec": 125, "end_sec": 155, "reason": "Fanny 1v3 clutch di lord pit, reaction kaget", "score": 9.5}},
+  {{"start_sec": 340, "end_sec": 370, "reason": "Ling 5-man ulti + quadra kill, teammate scream", "score": 9.2}}
+]
+
+Catatan:
+- start_sec < end_sec, beda = {clip_duration} detik
+- start_sec >= 0, end_sec <= {video_duration}
+- Urutkan dari score tertinggi
+- Hanya JSON, tanpa penjelasan tambahan"""
+
+        response = self.client.chat.completions.create(
+            model=Config.LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        
+        import json
+        try:
+            content = response.choices[0].message.content.strip()
+            # Extract JSON from response
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            highlights = json.loads(content.strip())
+            
+            # Validate highlights
+            valid_highlights = []
+            for h in highlights:
+                if isinstance(h, dict) and all(k in h for k in ["start_sec", "end_sec", "reason", "score"]):
+                    start = max(0, min(int(h["start_sec"]), video_duration - 1))
+                    end = min(video_duration, max(start + 1, int(h["end_sec"])))
+                    if end - start >= 5:
+                        valid_highlights.append({
+                            "start_sec": start,
+                            "end_sec": end,
+                            "duration": end - start,
+                            "reason": h["reason"][:200],
+                            "score": float(h["score"])
+                        })
+            
+            # Sort by score descending
+            valid_highlights.sort(key=lambda x: x["score"], reverse=True)
+            return valid_highlights[:max_highlights]
+            
+        except Exception as e:
+            logger.warning(f"⚠️ AI highlight extraction failed: {e}, fallback to random")
+            return []
 
 
 class VideoRenderer:
@@ -505,8 +678,8 @@ class ContentPipeline:
         Config.validate()
         self.db = GamingSourceDatabase()
         self.notifier = TelegramNotifier()
-        self.asset_mgr = VideoDownloaderManager()
         self.ai_engine = AIContentEngine()
+        self.asset_mgr = VideoDownloaderManager(ai_engine=self.ai_engine)
 
     def run(self):
         video_final = None
@@ -514,19 +687,17 @@ class ContentPipeline:
             logger.info("🚀 Memulai Gaming Clipper Factory (Clean Mode)...")
             self.notifier.send_message("🚀 Sedang memotong klip gaming terbaru...")
 
-            # 1. Ambil target video (now uses search_query + judul_game)
+            # 1. Ambil target video
             target = self.db.get_target_video()
             search_query = target["search_query"]
             game_title = target["judul_game"]
-            
-            # Random start time for variety (60-300 seconds into video)
-            start_seconds = random.uniform(60, 300)
-            
-            # 2. Download potongan video mentah dari YouTube (supports search query)
+
+            # 2. Download & AI Highlight Detection → clip best segment
+            # start_time_sec & duration akan di-determine oleh AI highlight detection di dalam
             raw_clip = self.asset_mgr.download_youtube_segment(
-                search_query, start_seconds, Config.CLIP_DURATION
+                search_query, 0, Config.CLIP_DURATION
             )
-            
+
             if not raw_clip:
                 raise ValueError("Gagal mengunduh potongan video dari YouTube.")
 
