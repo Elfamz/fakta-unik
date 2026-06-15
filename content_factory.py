@@ -63,12 +63,10 @@ class GamingSourceDatabase:
             except Exception as e:
                 logger.error(f"Gagal membaca database JSON: {e}")
         
-        # Fallback jika json kosong / belum dibuat
+        # Fallback jika json kosong / belum dibuat - format baru (search_query + judul_game)
         return {
-            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", 
-            "start_min": 1, 
-            "start_sec": 15,
-            "judul_game": "Gaming Montage"
+            "search_query": "mlbb best plays",
+            "judul_game": "Mobile Legends"
         }
 
 
