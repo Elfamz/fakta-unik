@@ -185,11 +185,16 @@ class VideoDownloaderManager:
         
         ydl_opts = {
             'format': (
+                # Priority 1: MP4 non-HLS at 720p (ideal)
                 'bestvideo[height<=720][ext=mp4][protocol!=m3u8]+bestaudio[ext=m4a]/'
                 'bestvideo[height<=720][ext=mp4][protocol!=m3u8]+bestaudio/'
-                'bestvideo[height<=720][vcodec^=avc1][protocol!=m3u8]+bestaudio[acodec^=mp4a]/'
-                'best[height<=720][protocol!=m3u8]/'
+                # Priority 2: Any non-HLS at 720p (webm, etc.)
+                'bestvideo[height<=720][protocol!=m3u8]+bestaudio/'
+                # Priority 3: HLS at 720p (yt-dlp can handle now)
+                'bestvideo[height<=720]+bestaudio/'
+                # Priority 4: Any 720p
                 'best[height<=720]/'
+                # Priority 5: Best available
                 'best'
             ),
             'outtmpl': temp_path,
