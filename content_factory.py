@@ -289,6 +289,7 @@ class VideoDownloaderManager:
             search_opts = {
                 'default_search': 'ytsearch1',
                 'skip_download': True,  # Only extract info, don't download
+                'format': 'bestaudio/best',  # Minimal format to avoid selection error
                 'quiet': True,
                 'nocheckcertificate': True,
                 'socket_timeout': 30,
