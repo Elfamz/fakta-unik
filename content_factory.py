@@ -286,16 +286,14 @@ class VideoDownloaderManager:
             # Minimal search opts - no format selector, just metadata extraction
             search_opts = {
                 'default_search': 'ytsearch1',
-                'skip_download': True,
+                'skip_download': True,  # Only extract info, don't download
                 'quiet': True,
                 'nocheckcertificate': True,
                 'socket_timeout': 30,
                 'retries': 2,
                 'ignoreerrors': False,
                 'no_warnings': True,
-                'extract_flat': True,  # Don't process video formats
                 'noplaylist': True,
-                'simulate': True,  # Don't actually download or process formats
             }
             if cookie_path:
                 search_opts['cookiefile'] = cookie_path
